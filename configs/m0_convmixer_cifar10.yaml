@@ -1,0 +1,15 @@
+model: convmixer
+name: M0_ConvMixer_Baseline
+dataset: cifar10
+seed: 0
+
+epochs: 100
+batch_size: 128
+hidden_dim: 256
+depth: 8
+patch_size: 2
+kernel_size: 5
+
+optimizer: adamw
+lr_max: 0.03
+weight_decay: 0.01
