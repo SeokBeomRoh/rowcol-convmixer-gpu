@@ -11,6 +11,7 @@ import torch.optim as optim
 
 from datasets.cifar import build_cifar10_dataloaders
 from models.convmixer import ConvMixer
+from models.rowcol_convmixer import RowColOnlyConvMixer, AdditiveRowColConvMixer
 from utils.seed import set_seed
 from utils.metrics import count_parameters, evaluate
 
@@ -19,8 +20,10 @@ def build_model(args):
     """
     Build model by name.
 
-    Current stage:
+    Supported models:
         M0: convmixer
+        M1: rowcol_only
+        M2: rowcol_add
     """
     if args.model == "convmixer":
         return ConvMixer(
@@ -30,6 +33,29 @@ def build_model(args):
             patch_size=args.psize,
             n_classes=10,
             in_channels=3,
+        )
+
+    if args.model == "rowcol_only":
+        return RowColOnlyConvMixer(
+            dim=args.hdim,
+            depth=args.depth,
+            patch_size=args.psize,
+            image_size=args.image_size,
+            n_classes=10,
+            in_channels=3,
+            rowcol_combine=args.rowcol_combine,
+        )
+
+    if args.model == "rowcol_add":
+        return AdditiveRowColConvMixer(
+            dim=args.hdim,
+            depth=args.depth,
+            kernel_size=args.conv_ks,
+            patch_size=args.psize,
+            image_size=args.image_size,
+            n_classes=10,
+            in_channels=3,
+            rowcol_combine=args.rowcol_combine,
         )
 
     raise ValueError(f"Unknown model: {args.model}")
@@ -79,6 +105,8 @@ def parse_args():
     parser.add_argument("--depth", default=8, type=int)
     parser.add_argument("--psize", default=2, type=int)
     parser.add_argument("--conv-ks", default=5, type=int)
+    parser.add_argument("--image-size", default=32, type=int)
+    parser.add_argument("--rowcol-combine", default="learnable", choices=["sum", "learnable", "softmax"])
 
     # Optimization
     parser.add_argument("--epochs", default=100, type=int)
@@ -254,6 +282,8 @@ def main():
         "depth": args.depth,
         "patch_size": args.psize,
         "kernel_size": args.conv_ks,
+        "image_size": args.image_size,
+        "rowcol_combine": args.rowcol_combine,
         "optimizer": "AdamW",
         "lr_max": args.lr_max,
         "weight_decay": args.wd,
