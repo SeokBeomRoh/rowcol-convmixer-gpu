@@ -145,3 +145,57 @@ Observation:
 - M3 outperforms M0 by 0.58 percentage points at depth=2.
 - This supports the hypothesis that RowCol branch is more useful in shallow ConvMixer models.
 - Next step: run depth=4 comparison.
+
+## Depth ablation: M0 vs M3, depth=4, seed 42, lr_max=0.01
+
+Common setting:
+- Dataset: CIFAR-10
+- Epochs: 100
+- Seed: 42
+- Hidden dim: 256
+- Depth: 4
+- Patch size: 2
+- Kernel size: 5
+- lr_max: 0.01
+- GPUs: RTX 4070 x2
+
+| Model | Depth | Train Loss | Train Acc | Test Acc | Best Test Acc | Best Epoch | Time |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| M0 ConvMixer | 4 | 0.1127 | 0.9621 | 0.9201 | 0.9212 | 93 | 85.5s |
+| M3 Weighted RowCol | 4 | 0.0923 | 0.9679 | 0.9220 | 0.9224 | 94 | 87.2s |
+
+Observation:
+- M3 outperforms M0 by 0.12 percentage points at depth=4.
+- The improvement is smaller than the depth=2 case, where M3 improved M0 by 0.58 percentage points.
+- This supports the hypothesis that Row-Col branch is more beneficial in shallow ConvMixer models.
+
+## Depth=2 seed extension: M0 vs M3, lr_max=0.01
+
+Common setting:
+- Dataset: CIFAR-10
+- Epochs: 100
+- Hidden dim: 256
+- Depth: 2
+- Patch size: 2
+- Kernel size: 5
+- lr_max: 0.01
+- GPUs: RTX 4070 x2
+
+| Model | Seed | Train Acc | Test Acc | Best Test Acc | Best Epoch | Time |
+|---|---:|---:|---:|---:|---:|---:|
+| M0 ConvMixer | 42 | 0.9074 | 0.8830 | 0.8847 | 92 | 76.3s |
+| M3 Weighted RowCol | 42 | 0.9229 | 0.8891 | 0.8905 | 88 | 80.4s |
+| M0 ConvMixer | 43 | 0.9114 | 0.8855 | 0.8880 | 91 | 82.6s |
+| M3 Weighted RowCol | 43 | 0.9275 | 0.8913 | 0.8940 | 93 | 84.2s |
+| M0 ConvMixer | 44 | 0.9064 | 0.8825 | 0.8841 | 89 | 82.5s |
+| M3 Weighted RowCol | 44 | 0.9242 | 0.8901 | 0.8901 | 99 | 79.5s |
+
+Summary:
+- M0 ConvMixer: 0.8856 ± 0.0017
+- M3 Weighted RowCol: 0.8915 ± 0.0021
+- Mean improvement: +0.0059
+
+Observation:
+- M3 outperforms M0 for all three seeds.
+- The improvement is consistent under the shallow depth=2 setting.
+- This supports the hypothesis that Row-Col branch is more beneficial when the ConvMixer depth is limited.
