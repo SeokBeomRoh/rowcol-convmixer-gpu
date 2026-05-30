@@ -232,3 +232,34 @@ Observation:
 - M5 improves M0 by approximately +0.85 percentage points.
 - M5 improves M3 by approximately +0.26 percentage points.
 - This supports the hypothesis that product-based Row-Col lifting provides a more expressive 2D reconstruction than additive Row-Col lifting.
+
+
+## M5 depth extension, seed 42, lr_max=0.01
+
+Common setting:
+- Dataset: CIFAR-10
+- Epochs: 100
+- Seed: 42
+- Hidden dim: 256
+- Patch size: 2
+- Kernel size: 5
+- lr_max: 0.01
+- GPUs: RTX 4070 x2
+- M5: multiplicative Row-Col lifting with channel-shared positional priors
+
+| Model | Depth | Train Loss | Train Acc | Test Acc | Best Test Acc | Best Epoch | Time |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| M5 Mul RowCol | 4 | 0.0938 | 0.9678 | 0.9228 | 0.9228 | 90 | 95.1s |
+| M5 Mul RowCol | 8 | 0.0550 | 0.9810 | 0.9393 | 0.9420 | 96 | 117.6s |
+
+Depth comparison, seed 42:
+| Depth | M0 | M3 | M5 | M5 - M0 |
+|---:|---:|---:|---:|---:|
+| 2 | 0.8847 | 0.8905 | 0.8947 | +0.0100 |
+| 4 | 0.9212 | 0.9224 | 0.9228 | +0.0016 |
+| 8 | 0.9414 | 0.9405 | 0.9420 | +0.0006 |
+
+Observation:
+- M5 outperforms M0 at depths 2, 4, and 8 for seed 42.
+- The improvement is largest at depth=2 and becomes smaller as depth increases.
+- This supports the hypothesis that product-based Row-Col lifting is most useful in shallow ConvMixer models.
