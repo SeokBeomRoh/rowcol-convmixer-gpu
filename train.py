@@ -11,7 +11,7 @@ import torch.optim as optim
 
 from datasets.cifar import build_cifar10_dataloaders
 from models.convmixer import ConvMixer
-from models.rowcol_convmixer import RowColOnlyConvMixer, AdditiveRowColConvMixer
+from models.rowcol_convmixer import RowColOnlyConvMixer, AdditiveRowColConvMixer, WeightedRowColConvMixer, WeightedMultiplicativeRowColConvMixer
 from utils.seed import set_seed
 from utils.metrics import count_parameters, evaluate
 
@@ -24,6 +24,7 @@ def build_model(args):
         M0: convmixer
         M1: rowcol_only
         M2: rowcol_add
+        M3: rowcol_weighted
     """
     if args.model == "convmixer":
         return ConvMixer(
@@ -56,6 +57,35 @@ def build_model(args):
             n_classes=10,
             in_channels=3,
             rowcol_combine=args.rowcol_combine,
+        )
+
+    if args.model == "rowcol_weighted":
+        return WeightedRowColConvMixer(
+            dim=args.hdim,
+            depth=args.depth,
+            kernel_size=args.conv_ks,
+            patch_size=args.psize,
+            image_size=args.image_size,
+            n_classes=10,
+            in_channels=3,
+            rowcol_combine=args.rowcol_combine,
+            local_init=args.local_scale_init,
+            rowcol_init=args.rowcol_scale_init,
+        )
+
+    if args.model == "rowcol_mul_weighted":
+        return WeightedMultiplicativeRowColConvMixer(
+            dim=args.hdim,
+            depth=args.depth,
+            kernel_size=args.conv_ks,
+            patch_size=args.psize,
+            image_size=args.image_size,
+            n_classes=10,
+            in_channels=3,
+            local_init=args.local_scale_init,
+            rowcol_init=args.rowcol_scale_init,
+            channel_specific_pos=args.mul_pos_channel_specific,
+            mul_pre_norm=not args.no_mul_pre_norm,
         )
 
     raise ValueError(f"Unknown model: {args.model}")
@@ -107,6 +137,10 @@ def parse_args():
     parser.add_argument("--conv-ks", default=5, type=int)
     parser.add_argument("--image-size", default=32, type=int)
     parser.add_argument("--rowcol-combine", default="learnable", choices=["sum", "learnable", "softmax"])
+    parser.add_argument("--local-scale-init", default=1.0, type=float)
+    parser.add_argument("--rowcol-scale-init", default=0.1, type=float)
+    parser.add_argument("--mul-pos-channel-specific", action="store_true")
+    parser.add_argument("--no-mul-pre-norm", action="store_true")
 
     # Optimization
     parser.add_argument("--epochs", default=100, type=int)
@@ -284,6 +318,10 @@ def main():
         "kernel_size": args.conv_ks,
         "image_size": args.image_size,
         "rowcol_combine": args.rowcol_combine,
+        "local_scale_init": args.local_scale_init,
+        "rowcol_scale_init": args.rowcol_scale_init,
+        "mul_pos_channel_specific": args.mul_pos_channel_specific,
+        "mul_pre_norm": not args.no_mul_pre_norm,
         "optimizer": "AdamW",
         "lr_max": args.lr_max,
         "weight_decay": args.wd,
@@ -301,6 +339,12 @@ def main():
         "total_train_time_sec": total_time,
         "timestamp": datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
     }
+
+    branch_scales = None
+    model_for_analysis = model.module if isinstance(model, nn.DataParallel) else model
+    if hasattr(model_for_analysis, "get_branch_scales"):
+        branch_scales = model_for_analysis.get_branch_scales()
+    results["branch_scales"] = branch_scales
 
     filename = (
         f"{args.name}"
