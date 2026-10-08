@@ -71,6 +71,7 @@ def build_model(args):
             rowcol_combine=args.rowcol_combine,
             local_init=args.local_scale_init,
             rowcol_init=args.rowcol_scale_init,
+            rowcol_pre_norm=getattr(args, "rowcol_pre_norm", False),
         )
 
     if args.model == "rowcol_mul_weighted":
@@ -86,6 +87,7 @@ def build_model(args):
             rowcol_init=args.rowcol_scale_init,
             channel_specific_pos=args.mul_pos_channel_specific,
             mul_pre_norm=not args.no_mul_pre_norm,
+            mul_pos_prior=not getattr(args, "no_mul_pos_prior", False),
         )
 
     raise ValueError(f"Unknown model: {args.model}")
@@ -105,6 +107,84 @@ def build_lr_schedule(args):
         )[0]
 
     return lr_schedule
+
+
+def get_rowcol_metadata(args):
+    """Return the effective RowCol condition represented by the model."""
+    if args.model == "convmixer":
+        return {
+            "rowcol_fusion": None,
+            "rowcol_pre_norm": None,
+            "rowcol_pos_prior": None,
+            "rowcol_branch_weight": None,
+        }
+
+    if args.model == "rowcol_mul_weighted":
+        return {
+            "rowcol_fusion": "multiply",
+            "rowcol_pre_norm": not args.no_mul_pre_norm,
+            "rowcol_pos_prior": not getattr(args, "no_mul_pos_prior", False),
+            "rowcol_branch_weight": False,
+        }
+
+    return {
+        "rowcol_fusion": "additive",
+        "rowcol_pre_norm": (
+            getattr(args, "rowcol_pre_norm", False)
+            if args.model == "rowcol_weighted"
+            else False
+        ),
+        "rowcol_pos_prior": False,
+        "rowcol_branch_weight": args.rowcol_combine in ["learnable", "softmax"],
+    }
+
+
+def condition_token(value):
+    if value is None:
+        return "na"
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    return str(value)
+
+
+def build_result_filename(args, rowcol_metadata, collision_suffix=None):
+    filename = (
+        f"{args.name}"
+        f"_model_{args.model}"
+        f"_seed_{args.seed}"
+        f"_dim_{args.hdim}"
+        f"_depth_{args.depth}"
+        f"_psize_{args.psize}"
+        f"_ks_{args.conv_ks}"
+        f"_fusion_{condition_token(rowcol_metadata['rowcol_fusion'])}"
+        f"_prenorm_{condition_token(rowcol_metadata['rowcol_pre_norm'])}"
+        f"_posprior_{condition_token(rowcol_metadata['rowcol_pos_prior'])}"
+        f"_branchweight_{condition_token(rowcol_metadata['rowcol_branch_weight'])}"
+        f"_epochs_{args.epochs}"
+        f"_lr_{args.lr_max:g}"
+        f"_wd_{args.wd:g}"
+    )
+    if collision_suffix is not None:
+        filename += f"_run_{collision_suffix}"
+    return f"{filename}.json"
+
+
+def save_results_without_overwrite(results, args, rowcol_metadata):
+    """Write results to a new file, preserving any existing experiment output."""
+    collision_suffix = None
+    collision_index = 0
+
+    while True:
+        filename = build_result_filename(args, rowcol_metadata, collision_suffix)
+        result_path = os.path.join(args.results_dir, filename)
+        try:
+            with open(result_path, "x") as f:
+                json.dump(results, f, indent=4)
+            return result_path
+        except FileExistsError:
+            collision_index += 1
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            collision_suffix = f"{timestamp}-{collision_index}"
 
 
 def parse_args():
@@ -137,10 +217,12 @@ def parse_args():
     parser.add_argument("--conv-ks", default=5, type=int)
     parser.add_argument("--image-size", default=32, type=int)
     parser.add_argument("--rowcol-combine", default="learnable", choices=["sum", "learnable", "softmax"])
+    parser.add_argument("--rowcol-pre-norm", action="store_true")
     parser.add_argument("--local-scale-init", default=1.0, type=float)
     parser.add_argument("--rowcol-scale-init", default=0.1, type=float)
     parser.add_argument("--mul-pos-channel-specific", action="store_true")
     parser.add_argument("--no-mul-pre-norm", action="store_true")
+    parser.add_argument("--no-mul-pos-prior", action="store_true")
 
     # Optimization
     parser.add_argument("--epochs", default=100, type=int)
@@ -304,6 +386,7 @@ def main():
         )
 
     total_time = time.time() - total_start
+    rowcol_metadata = get_rowcol_metadata(args)
 
     results = {
         "model": args.model,
@@ -322,6 +405,7 @@ def main():
         "rowcol_scale_init": args.rowcol_scale_init,
         "mul_pos_channel_specific": args.mul_pos_channel_specific,
         "mul_pre_norm": not args.no_mul_pre_norm,
+        **rowcol_metadata,
         "optimizer": "AdamW",
         "lr_max": args.lr_max,
         "weight_decay": args.wd,
@@ -346,20 +430,7 @@ def main():
         branch_scales = model_for_analysis.get_branch_scales()
     results["branch_scales"] = branch_scales
 
-    filename = (
-        f"{args.name}"
-        f"_model_{args.model}"
-        f"_seed_{args.seed}"
-        f"_dim_{args.hdim}"
-        f"_depth_{args.depth}"
-        f"_psize_{args.psize}"
-        f"_ks_{args.conv_ks}.json"
-    )
-
-    result_path = os.path.join(args.results_dir, filename)
-
-    with open(result_path, "w") as f:
-        json.dump(results, f, indent=4)
+    result_path = save_results_without_overwrite(results, args, rowcol_metadata)
 
     print(f"Results saved to {result_path}")
 

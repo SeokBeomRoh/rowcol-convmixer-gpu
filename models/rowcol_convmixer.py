@@ -127,6 +127,7 @@ class WeightedRowColBlock(nn.Module):
         rowcol_combine: str = "learnable",
         local_init: float = 1.0,
         rowcol_init: float = 0.1,
+        rowcol_pre_norm: bool = False,
     ):
         super().__init__()
 
@@ -149,6 +150,7 @@ class WeightedRowColBlock(nn.Module):
             combine=rowcol_combine,
             use_bn=True,
             use_activation=True,
+            pre_norm=rowcol_pre_norm,
         )
 
         self.local_scale = nn.Parameter(torch.tensor(float(local_init)))
@@ -324,6 +326,7 @@ class WeightedRowColConvMixer(nn.Module):
         rowcol_combine: str = "learnable",
         local_init: float = 1.0,
         rowcol_init: float = 0.1,
+        rowcol_pre_norm: bool = False,
     ):
         super().__init__()
 
@@ -356,6 +359,7 @@ class WeightedRowColConvMixer(nn.Module):
                     rowcol_combine=rowcol_combine,
                     local_init=local_init,
                     rowcol_init=rowcol_init,
+                    rowcol_pre_norm=rowcol_pre_norm,
                 )
                 for _ in range(depth)
             ]
@@ -413,6 +417,7 @@ class WeightedMultiplicativeRowColBlock(nn.Module):
         rowcol_init: float = 0.1,
         channel_specific_pos: bool = False,
         mul_pre_norm: bool = True,
+        mul_pos_prior: bool = True,
     ):
         super().__init__()
 
@@ -436,6 +441,7 @@ class WeightedMultiplicativeRowColBlock(nn.Module):
             pre_norm=mul_pre_norm,
             use_bn=True,
             use_activation=True,
+            use_pos_prior=mul_pos_prior,
         )
 
         self.local_scale = nn.Parameter(torch.tensor(float(local_init)))
@@ -482,6 +488,7 @@ class WeightedMultiplicativeRowColConvMixer(nn.Module):
         rowcol_init: float = 0.1,
         channel_specific_pos: bool = False,
         mul_pre_norm: bool = True,
+        mul_pos_prior: bool = True,
     ):
         super().__init__()
 
@@ -515,6 +522,7 @@ class WeightedMultiplicativeRowColConvMixer(nn.Module):
                     rowcol_init=rowcol_init,
                     channel_specific_pos=channel_specific_pos,
                     mul_pre_norm=mul_pre_norm,
+                    mul_pos_prior=mul_pos_prior,
                 )
                 for _ in range(depth)
             ]
