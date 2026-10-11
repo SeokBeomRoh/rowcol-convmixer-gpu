@@ -2,7 +2,7 @@ import os
 import json
 import time
 import argparse
-import copy
+import tempfile
 from datetime import datetime
 
 import numpy as np
@@ -191,7 +191,30 @@ def save_results_without_overwrite(results, args, rowcol_metadata):
             collision_suffix = f"{timestamp}-{collision_index}"
 
 
-def save_checkpoint_without_overwrite(checkpoint, args):
+def clone_state_dict_to_cpu(state_dict):
+    """Recursively clone a (possibly nested) state dict with all tensors moved to CPU.
+
+    Used for both model and optimizer state dicts so the saved/retained copy
+    cannot be mutated by ongoing training (no reference aliasing) and does not
+    hold extra GPU memory.
+    """
+    if torch.is_tensor(state_dict):
+        return state_dict.detach().cpu().clone()
+    if isinstance(state_dict, dict):
+        return {key: clone_state_dict_to_cpu(value) for key, value in state_dict.items()}
+    if isinstance(state_dict, list):
+        return [clone_state_dict_to_cpu(value) for value in state_dict]
+    if isinstance(state_dict, tuple):
+        return tuple(clone_state_dict_to_cpu(value) for value in state_dict)
+    return state_dict
+
+
+def reserve_checkpoint_path(args):
+    """Atomically claim a checkpoint filename unique to this run.
+
+    Creating the file with O_CREAT|O_EXCL guarantees two runs started with the
+    same args never end up writing to the same path, even if they race.
+    """
     checkpoint_name = f"{args.name}_seed_{args.seed}"
     if args.eval_protocol == "train_val_test":
         checkpoint_name += f"_eval_train_val_test_val_{args.val_ratio:g}_split_{args.split_seed}"
@@ -200,12 +223,44 @@ def save_checkpoint_without_overwrite(checkpoint, args):
     while True:
         checkpoint_path = os.path.join(args.checkpoint_dir, filename)
         try:
-            with open(checkpoint_path, "xb") as checkpoint_file:
-                torch.save(checkpoint, checkpoint_file)
+            fd = os.open(checkpoint_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
             return checkpoint_path
         except FileExistsError:
             suffix += 1
             filename = f"{checkpoint_name}_best_run_{suffix}.pt"
+
+
+def atomic_save_checkpoint(checkpoint, checkpoint_path, reserved_file=False):
+    """Write checkpoint to a temp file in the same directory, then atomically replace checkpoint_path.
+
+    On a Python exception, discard the temp file. A failed first save also
+    removes this run's unchanged, empty reservation; later failures leave the
+    previously saved checkpoint untouched. SIGKILL cannot run this cleanup.
+    """
+    directory = os.path.dirname(checkpoint_path) or "."
+    tmp_path = None
+    reservation = None
+    try:
+        if reserved_file:
+            reservation = os.stat(checkpoint_path)
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp_ckpt_", suffix=".pt")
+        with os.fdopen(tmp_fd, "wb") as tmp_file:
+            torch.save(checkpoint, tmp_file)
+        os.replace(tmp_path, checkpoint_path)
+    except Exception:
+        if tmp_path is not None and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        if reservation is not None:
+            try:
+                current = os.stat(checkpoint_path)
+                if (current.st_dev, current.st_ino, current.st_size) == (
+                    reservation.st_dev, reservation.st_ino, 0
+                ):
+                    os.remove(checkpoint_path)
+            except FileNotFoundError:
+                pass
+        raise
 
 
 def parse_args():
@@ -333,7 +388,7 @@ def main():
     best_val_acc = -1.0
     best_epoch = -1
     best_model_state = None
-    best_optimizer_state = None
+    checkpoint_path = None
     last_train_loss = 0.0
     last_train_acc = 0.0
     last_test_acc = 0.0
@@ -382,20 +437,38 @@ def main():
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_epoch = epoch
-                best_model_state = {
-                    key: value.detach().cpu().clone()
-                    for key, value in model.state_dict().items()
-                }
+                best_model_state = clone_state_dict_to_cpu(model.state_dict())
+
                 if args.save_checkpoint:
-                    best_optimizer_state = copy.deepcopy(optimizer.state_dict())
+                    checkpoint = {
+                        "epoch": best_epoch,
+                        "model_state_dict": best_model_state,
+                        "optimizer_state_dict": clone_state_dict_to_cpu(optimizer.state_dict()),
+                        "best_val_acc": best_val_acc,
+                        "args": vars(args),
+                    }
+                    first_save = checkpoint_path is None
+                    if first_save:
+                        checkpoint_path = reserve_checkpoint_path(args)
+                    atomic_save_checkpoint(checkpoint, checkpoint_path, reserved_file=first_save)
         else:
             test_acc = evaluate(model, testloader, device)
             if test_acc > best_test_acc:
                 best_test_acc = test_acc
                 best_epoch = epoch
+
                 if args.save_checkpoint:
-                    best_model_state = copy.deepcopy(model.state_dict())
-                    best_optimizer_state = copy.deepcopy(optimizer.state_dict())
+                    checkpoint = {
+                        "epoch": best_epoch,
+                        "model_state_dict": clone_state_dict_to_cpu(model.state_dict()),
+                        "optimizer_state_dict": clone_state_dict_to_cpu(optimizer.state_dict()),
+                        "best_test_acc": best_test_acc,
+                        "args": vars(args),
+                    }
+                    first_save = checkpoint_path is None
+                    if first_save:
+                        checkpoint_path = reserve_checkpoint_path(args)
+                    atomic_save_checkpoint(checkpoint, checkpoint_path, reserved_file=first_save)
 
         last_train_loss = train_loss
         last_train_acc = train_acc
@@ -427,18 +500,8 @@ def main():
         final_test_acc = evaluate(model, testloader, device)
         print(f"Final Test Acc {final_test_acc:.4f} (best epoch {best_epoch})")
 
-    if args.save_checkpoint and best_model_state is not None:
-        checkpoint = {
-            "epoch": best_epoch,
-            "model_state_dict": best_model_state,
-            "optimizer_state_dict": best_optimizer_state,
-            "args": vars(args),
-        }
-        checkpoint[
-            "best_val_acc" if args.eval_protocol == "train_val_test" else "best_test_acc"
-        ] = best_val_acc if args.eval_protocol == "train_val_test" else best_test_acc
-        checkpoint_path = save_checkpoint_without_overwrite(checkpoint, args)
-        print(f"Checkpoint saved to {checkpoint_path}")
+    if checkpoint_path is not None:
+        print(f"Best checkpoint (epoch {best_epoch}) is at {checkpoint_path}")
     rowcol_metadata = get_rowcol_metadata(args)
 
     results = {
@@ -468,6 +531,7 @@ def main():
         "cuda_device_count": torch.cuda.device_count(),
         "torch_version": torch.__version__,
         "torch_cuda_version": torch.version.cuda,
+        "eval_protocol": args.eval_protocol,
         "best_epoch": best_epoch,
         "last_train_loss": last_train_loss,
         "last_train_acc": last_train_acc,
@@ -477,7 +541,6 @@ def main():
 
     if args.eval_protocol == "train_val_test":
         results.update({
-            "eval_protocol": args.eval_protocol,
             "val_ratio": args.val_ratio,
             "split_seed": args.split_seed,
             "train_samples": len(trainloader.dataset),
