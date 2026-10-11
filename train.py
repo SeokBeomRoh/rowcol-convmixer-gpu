@@ -2,6 +2,7 @@ import os
 import json
 import time
 import argparse
+import copy
 from datetime import datetime
 
 import numpy as np
@@ -9,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from datasets.cifar import build_cifar10_dataloaders
+from datasets.cifar import build_cifar10_dataloaders, build_cifar_train_val_test_dataloaders
 from models.convmixer import ConvMixer
 from models.rowcol_convmixer import RowColOnlyConvMixer, AdditiveRowColConvMixer, WeightedRowColConvMixer, WeightedMultiplicativeRowColConvMixer
 from utils.seed import set_seed
@@ -26,13 +27,14 @@ def build_model(args):
         M2: rowcol_add
         M3: rowcol_weighted
     """
+    n_classes = 100 if getattr(args, "dataset", "CIFAR10") == "CIFAR100" else 10
     if args.model == "convmixer":
         return ConvMixer(
             dim=args.hdim,
             depth=args.depth,
             kernel_size=args.conv_ks,
             patch_size=args.psize,
-            n_classes=10,
+            n_classes=n_classes,
             in_channels=3,
         )
 
@@ -42,7 +44,7 @@ def build_model(args):
             depth=args.depth,
             patch_size=args.psize,
             image_size=args.image_size,
-            n_classes=10,
+            n_classes=n_classes,
             in_channels=3,
             rowcol_combine=args.rowcol_combine,
         )
@@ -54,7 +56,7 @@ def build_model(args):
             kernel_size=args.conv_ks,
             patch_size=args.psize,
             image_size=args.image_size,
-            n_classes=10,
+            n_classes=n_classes,
             in_channels=3,
             rowcol_combine=args.rowcol_combine,
         )
@@ -66,7 +68,7 @@ def build_model(args):
             kernel_size=args.conv_ks,
             patch_size=args.psize,
             image_size=args.image_size,
-            n_classes=10,
+            n_classes=n_classes,
             in_channels=3,
             rowcol_combine=args.rowcol_combine,
             local_init=args.local_scale_init,
@@ -81,7 +83,7 @@ def build_model(args):
             kernel_size=args.conv_ks,
             patch_size=args.psize,
             image_size=args.image_size,
-            n_classes=10,
+            n_classes=n_classes,
             in_channels=3,
             local_init=args.local_scale_init,
             rowcol_init=args.rowcol_scale_init,
@@ -164,6 +166,8 @@ def build_result_filename(args, rowcol_metadata, collision_suffix=None):
         f"_lr_{args.lr_max:g}"
         f"_wd_{args.wd:g}"
     )
+    if args.eval_protocol == "train_val_test":
+        filename += f"_eval_train_val_test_val_{args.val_ratio:g}_split_{args.split_seed}"
     if collision_suffix is not None:
         filename += f"_run_{collision_suffix}"
     return f"{filename}.json"
@@ -187,6 +191,23 @@ def save_results_without_overwrite(results, args, rowcol_metadata):
             collision_suffix = f"{timestamp}-{collision_index}"
 
 
+def save_checkpoint_without_overwrite(checkpoint, args):
+    checkpoint_name = f"{args.name}_seed_{args.seed}"
+    if args.eval_protocol == "train_val_test":
+        checkpoint_name += f"_eval_train_val_test_val_{args.val_ratio:g}_split_{args.split_seed}"
+    filename = f"{checkpoint_name}_best.pt"
+    suffix = 0
+    while True:
+        checkpoint_path = os.path.join(args.checkpoint_dir, filename)
+        try:
+            with open(checkpoint_path, "xb") as checkpoint_file:
+                torch.save(checkpoint, checkpoint_file)
+            return checkpoint_path
+        except FileExistsError:
+            suffix += 1
+            filename = f"{checkpoint_name}_best_run_{suffix}.pt"
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
 
@@ -200,6 +221,10 @@ def parse_args():
     parser.add_argument("--results-dir", type=str, default="./results")
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints")
     parser.add_argument("--save-checkpoint", action="store_true")
+    parser.add_argument("--dataset", default="CIFAR10", choices=["CIFAR10", "CIFAR100"])
+    parser.add_argument("--eval-protocol", default="legacy", choices=["legacy", "train_val_test"])
+    parser.add_argument("--val-ratio", default=0.1, type=float)
+    parser.add_argument("--split-seed", default=42, type=int)
 
     # Data augmentation
     parser.add_argument("--batch-size", default=128, type=int)
@@ -273,7 +298,12 @@ def main():
     print(f"Model: {args.model}")
     print(f"Seed: {args.seed}")
 
-    trainloader, testloader = build_cifar10_dataloaders(args)
+    if args.eval_protocol == "train_val_test":
+        trainloader, valloader, testloader = build_cifar_train_val_test_dataloaders(args)
+    else:
+        if args.dataset != "CIFAR10":
+            raise ValueError("CIFAR100 requires --eval-protocol train_val_test")
+        trainloader, testloader = build_cifar10_dataloaders(args)
 
     model = build_model(args)
     model = model.to(device)
@@ -300,7 +330,10 @@ def main():
     lr_schedule = build_lr_schedule(args)
 
     best_test_acc = 0.0
+    best_val_acc = -1.0
     best_epoch = -1
+    best_model_state = None
+    best_optimizer_state = None
     last_train_loss = 0.0
     last_train_acc = 0.0
     last_test_acc = 0.0
@@ -344,54 +377,74 @@ def main():
         train_loss = train_loss_sum / train_total
         train_acc = train_correct / train_total
 
-        test_acc = evaluate(model, testloader, device)
-
-        if test_acc > best_test_acc:
-            best_test_acc = test_acc
-            best_epoch = epoch
-
-            if args.save_checkpoint:
-                ckpt_name = (
-                    f"{args.name}"
-                    f"_seed_{args.seed}"
-                    f"_best.pt"
-                )
-                ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "best_test_acc": best_test_acc,
-                        "args": vars(args),
-                    },
-                    ckpt_path,
-                )
+        if args.eval_protocol == "train_val_test":
+            val_acc = evaluate(model, valloader, device)
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_epoch = epoch
+                best_model_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in model.state_dict().items()
+                }
+                if args.save_checkpoint:
+                    best_optimizer_state = copy.deepcopy(optimizer.state_dict())
+        else:
+            test_acc = evaluate(model, testloader, device)
+            if test_acc > best_test_acc:
+                best_test_acc = test_acc
+                best_epoch = epoch
+                if args.save_checkpoint:
+                    best_model_state = copy.deepcopy(model.state_dict())
+                    best_optimizer_state = copy.deepcopy(optimizer.state_dict())
 
         last_train_loss = train_loss
         last_train_acc = train_acc
-        last_test_acc = test_acc
+        if args.eval_protocol == "legacy":
+            last_test_acc = test_acc
 
         elapsed = time.time() - start
 
+        evaluation_status = (
+            f"Val Acc {val_acc:.4f} | Best {best_val_acc:.4f} @ {best_epoch}"
+            if args.eval_protocol == "train_val_test"
+            else f"Test Acc {test_acc:.4f} | Best {best_test_acc:.4f} @ {best_epoch}"
+        )
         print(
             f"[{args.name}] "
             f"Epoch {epoch:03d}/{args.epochs - 1:03d} | "
             f"Train Loss {train_loss:.4f} | "
             f"Train Acc {train_acc:.4f} | "
-            f"Test Acc {test_acc:.4f} | "
-            f"Best {best_test_acc:.4f} @ {best_epoch} | "
+            f"{evaluation_status} | "
             f"LR {lr:.6f} | "
             f"Time {elapsed:.1f}s"
         )
 
     total_time = time.time() - total_start
+    if args.eval_protocol == "train_val_test":
+        if best_model_state is None:
+            raise ValueError("train_val_test requires at least one epoch")
+        model.load_state_dict(best_model_state)
+        final_test_acc = evaluate(model, testloader, device)
+        print(f"Final Test Acc {final_test_acc:.4f} (best epoch {best_epoch})")
+
+    if args.save_checkpoint and best_model_state is not None:
+        checkpoint = {
+            "epoch": best_epoch,
+            "model_state_dict": best_model_state,
+            "optimizer_state_dict": best_optimizer_state,
+            "args": vars(args),
+        }
+        checkpoint[
+            "best_val_acc" if args.eval_protocol == "train_val_test" else "best_test_acc"
+        ] = best_val_acc if args.eval_protocol == "train_val_test" else best_test_acc
+        checkpoint_path = save_checkpoint_without_overwrite(checkpoint, args)
+        print(f"Checkpoint saved to {checkpoint_path}")
     rowcol_metadata = get_rowcol_metadata(args)
 
     results = {
         "model": args.model,
         "name": args.name,
-        "dataset": "CIFAR10",
+        "dataset": args.dataset,
         "seed": args.seed,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
@@ -415,14 +468,26 @@ def main():
         "cuda_device_count": torch.cuda.device_count(),
         "torch_version": torch.__version__,
         "torch_cuda_version": torch.version.cuda,
-        "best_test_acc": best_test_acc,
         "best_epoch": best_epoch,
         "last_train_loss": last_train_loss,
         "last_train_acc": last_train_acc,
-        "last_test_acc": last_test_acc,
         "total_train_time_sec": total_time,
         "timestamp": datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
     }
+
+    if args.eval_protocol == "train_val_test":
+        results.update({
+            "eval_protocol": args.eval_protocol,
+            "val_ratio": args.val_ratio,
+            "split_seed": args.split_seed,
+            "train_samples": len(trainloader.dataset),
+            "val_samples": len(valloader.dataset),
+            "test_samples": len(testloader.dataset),
+            "best_val_acc": best_val_acc,
+            "final_test_acc": final_test_acc,
+        })
+    else:
+        results.update({"best_test_acc": best_test_acc, "last_test_acc": last_test_acc})
 
     branch_scales = None
     model_for_analysis = model.module if isinstance(model, nn.DataParallel) else model

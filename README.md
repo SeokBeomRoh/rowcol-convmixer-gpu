@@ -67,3 +67,11 @@ python train.py --model convmixer --epochs 100 --seed 0 --gpu-ids 0,1
 python train.py --model convmixer --epochs 100 --seed 1 --gpu-ids 0,1
 python train.py --model convmixer --epochs 100 --seed 2 --gpu-ids 0,1
 ```
+
+## Validation protocol for M3/M5 controls
+
+`bash scripts/run_m3_m5_controls_wsl.sh` runs A–E with `--eval-protocol train_val_test`, `--val-ratio 0.1`, and `--split-seed 42`. Each run uses a class-stratified 90/10 split of the official training set; the official test set is evaluated once after restoring the best validation epoch. Set `SAVE_CHECKPOINT=1` to save that model. Results and checkpoints use new filenames if a matching file already exists.
+
+The default `--eval-protocol legacy` keeps the previous train/test behavior. To run the new protocol directly, use `python train.py --model rowcol_weighted --eval-protocol train_val_test --dataset CIFAR10`; `--dataset CIFAR100` is also supported with the new protocol.
+
+Run the synthetic validation checks with `python scripts/verify_validation_protocol.py` in the configured environment. These checks do not download CIFAR or perform full training.
