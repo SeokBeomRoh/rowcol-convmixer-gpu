@@ -50,6 +50,37 @@ class TinyBatchNormModel(nn.Module):
         return self.linear(self.bn(inputs))
 
 
+PER_DEVICE_BATCH_SIZE = 4
+
+
+def train_data_parallel_device_count():
+    """Number of devices train.main() splits each batch across with the default --gpu-ids."""
+    with patch.object(sys, "argv", ["train.py"]):
+        requested_gpu_ids = [int(x) for x in train.parse_args().gpu_ids.split(",") if x.strip() != ""]
+    return max(1, len([i for i in requested_gpu_ids if i < torch.cuda.device_count()]))
+
+
+def data_parallel_model(model):
+    """Return a model whose state_dict keys carry the DataParallel ``module.`` prefix.
+
+    With 2+ GPUs train.main() wraps the model in DataParallel itself; wrapping it here
+    too would nest DataParallel, whose inner replica on cuda:1 fails the device check
+    and re-splits each per-GPU batch.
+    """
+    return model if train_data_parallel_device_count() > 1 else nn.DataParallel(model)
+
+
+def assert_all_tensors_on_cpu(test_case, state):
+    if torch.is_tensor(state):
+        test_case.assertEqual(state.device.type, "cpu")
+    elif isinstance(state, dict):
+        for value in state.values():
+            assert_all_tensors_on_cpu(test_case, value)
+    elif isinstance(state, (list, tuple)):
+        for value in state:
+            assert_all_tensors_on_cpu(test_case, value)
+
+
 class ValidationProtocolChecks(unittest.TestCase):
     def assert_state_equal(self, actual, expected):
         if torch.is_tensor(expected):
@@ -67,9 +98,13 @@ class ValidationProtocolChecks(unittest.TestCase):
             self.assertEqual(actual, expected)
 
     def run_three_epoch_checkpoint(self):
-        data = TensorDataset(torch.arange(24, dtype=torch.float32).reshape(8, 3) / 10,
-                             torch.tensor([0, 1] * 4))
-        loader = DataLoader(data, batch_size=4)
+        # Two steps per epoch with PER_DEVICE_BATCH_SIZE samples per device, so every
+        # DataParallel replica's BatchNorm sees a training batch larger than 1.
+        batch_size = PER_DEVICE_BATCH_SIZE * train_data_parallel_device_count()
+        sample_count = 2 * batch_size
+        data = TensorDataset(torch.arange(sample_count * 3, dtype=torch.float32).reshape(sample_count, 3) / 10,
+                             torch.tensor([0, 1] * batch_size))
+        loader = DataLoader(data, batch_size=batch_size)
         snapshots = []
         saved = []
         optimizer_ref = []
@@ -88,6 +123,7 @@ class ValidationProtocolChecks(unittest.TestCase):
             return (0.60, 0.75, 0.70, 0.50)[len(snapshots) - 1]
 
         def capture_save(checkpoint, path, **kwargs):
+            assert_all_tensors_on_cpu(self, checkpoint)
             original_save(checkpoint, path, **kwargs)
             saved.append((path, torch.load(path, map_location="cpu", weights_only=False)))
 
@@ -99,7 +135,7 @@ class ValidationProtocolChecks(unittest.TestCase):
             ]
             with patch.object(sys, "argv", arguments), patch.object(
                 train, "build_cifar_train_val_test_dataloaders", return_value=(loader, loader, loader)
-            ), patch.object(train, "build_model", return_value=nn.DataParallel(TinyBatchNormModel())), patch.object(
+            ), patch.object(train, "build_model", return_value=data_parallel_model(TinyBatchNormModel())), patch.object(
                 train.optim, "AdamW", side_effect=capture_optimizer
             ), patch.object(train, "evaluate", side_effect=fake_evaluate), patch.object(
                 train, "atomic_save_checkpoint", side_effect=capture_save
@@ -160,7 +196,7 @@ class ValidationProtocolChecks(unittest.TestCase):
             ]
             with patch.object(sys, "argv", arguments), patch.object(
                 train, "build_cifar_train_val_test_dataloaders", return_value=(trainloader, valloader, testloader)
-            ), patch.object(train, "build_model", return_value=nn.DataParallel(TinyModel())), patch.object(
+            ), patch.object(train, "build_model", return_value=data_parallel_model(TinyModel())), patch.object(
                 train, "evaluate", side_effect=fake_evaluate
             ):
                 train.main()
@@ -173,10 +209,13 @@ class ValidationProtocolChecks(unittest.TestCase):
             self.assertEqual((result["train_samples"], result["val_samples"], result["test_samples"]), (8, 8, 8))
             self.assertEqual(result["eval_protocol"], "train_val_test")
             self.assertNotIn("best_test_acc", result)
-            checkpoint = torch.load(next(Path(temporary_dir).glob("*.pt")), map_location="cpu", weights_only=False)
+            # No map_location: tensors must already have been saved on CPU.
+            checkpoint = torch.load(next(Path(temporary_dir).glob("*.pt")), weights_only=False)
             self.assertEqual(checkpoint["epoch"], 0)
+            assert_all_tensors_on_cpu(self, checkpoint)
             for key in snapshots[0]:
-                torch.testing.assert_close(checkpoint["model_state_dict"][key], snapshots[0][key])
+                # Snapshots are taken on the training device; compare values on CPU.
+                torch.testing.assert_close(checkpoint["model_state_dict"][key], snapshots[0][key].cpu())
 
             checkpoint_paths = set(Path(temporary_dir).glob("*.pt"))
             result_paths = set(Path(temporary_dir).glob("*.json"))
@@ -330,6 +369,7 @@ class ValidationProtocolChecks(unittest.TestCase):
 
     def test_clone_state_dict_to_cpu_is_independent_copy(self):
         model = TinyModel()
+        original_model_state = {key: value.detach().clone() for key, value in model.state_dict().items()}
         cloned_model_state = train.clone_state_dict_to_cpu(model.state_dict())
         for tensor in cloned_model_state.values():
             self.assertEqual(tensor.device.type, "cpu")
@@ -338,6 +378,7 @@ class ValidationProtocolChecks(unittest.TestCase):
             for param in model.parameters():
                 param.add_(1.0)
         for key, tensor in cloned_model_state.items():
+            torch.testing.assert_close(tensor, original_model_state[key])
             self.assertFalse(torch.equal(tensor, model.state_dict()[key]))
 
         optimizer = optim.AdamW(model.parameters(), lr=0.1)
@@ -360,12 +401,14 @@ class ValidationProtocolChecks(unittest.TestCase):
             source["list"][0].add_(10)
             source["tuple"][0].add_(10)
             source["tuple"][1]["x"].add_(10)
-        for actual, original in ((copied["list"][0], source["list"][0]),
-                                 (copied["tuple"][0], source["tuple"][0]),
-                                 (copied["tuple"][1]["x"], source["tuple"][1]["x"])):
+        for actual, original, expected in ((copied["list"][0], source["list"][0], torch.arange(3.0)),
+                                           (copied["tuple"][0], source["tuple"][0], torch.arange(2.0)),
+                                           (copied["tuple"][1]["x"], source["tuple"][1]["x"], torch.ones(2))):
             self.assertEqual(actual.device.type, "cpu")
             self.assertNotEqual(actual.data_ptr(), original.data_ptr())
-            self.assertFalse(torch.equal(actual, original))
+            # The copy keeps the pre-mutation values while the (possibly CUDA) original changed.
+            torch.testing.assert_close(actual, expected)
+            self.assertFalse(torch.equal(actual, original.cpu()))
 
     def test_optimizer_state_not_cloned_when_checkpoint_disabled(self):
         """Without --save-checkpoint, optimizer.state_dict() must never be cloned,
